@@ -185,6 +185,27 @@ function listenAnnouncements() {
   }, (err) => console.error('❌ Firestore announcements error:', err));
 }
 
+// ── 3. Endpoint : supprimer un utilisateur Firebase Auth ─────────────────────
+app.post('/deleteUser', async (req, res) => {
+  const { uid, secret } = req.body;
+
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!uid) {
+    return res.status(400).json({ error: 'uid requis' });
+  }
+
+  try {
+    await admin.auth().deleteUser(uid);
+    console.log(`🗑️ Auth supprimé : ${uid}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`❌ deleteUser error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Démarrage ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
