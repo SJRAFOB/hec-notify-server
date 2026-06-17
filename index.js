@@ -6,8 +6,9 @@
 //   2. announcements             → notif par topic (tous / rôle / niveau / filière)
 //   3. schedules                 → notif aux étudiants concernés lors d'un nouveau cours
 
-const express = require('express');
-const admin   = require('firebase-admin');
+const express   = require('express');
+const admin     = require('firebase-admin');
+const rateLimit = require('express-rate-limit');
 
 // ── Firebase Admin ─────────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.GOOGLE_CREDENTIALS);
@@ -15,7 +16,44 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const db  = admin.firestore();
 const app = express();
-app.use(express.json());
+
+// ── Sécurité : désactiver les en-têtes révélateurs ────────────────────────────
+app.disable('x-powered-by');
+
+// ── CORS : bloquer les requêtes navigateur (l'app est mobile uniquement) ───────
+app.use((req, res, next) => {
+  // Log utile pour diagnostic — à retirer en production stable
+  if (req.path !== '/') {
+    console.log(`[${req.method}] ${req.path} | origin="${req.headers.origin ?? 'none'}" ua="${(req.headers['user-agent'] ?? '').slice(0, 60)}"`);
+  }
+  // L'app Flutter mobile n'envoie pas d'en-tête Origin.
+  // Si Origin est présent → requête depuis un navigateur → bloquer.
+  if (req.headers.origin) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+});
+
+app.use(express.json({ limit: '10kb' })); // Limite le body à 10 Ko
+
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+// Validation de code d'accès : 10 tentatives / 15 min par IP
+const codeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { valid: false, error: 'Trop de tentatives. Réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Endpoints admin (disable/delete) : 20 requêtes / 5 min par IP
+const adminLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  message: { error: 'Trop de requêtes. Réessayez plus tard.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ── Health check (keep-alive) ─────────────────────────────────────────────────
 app.get('/',     (_req, res) => res.send('HEC Notify Server ✅'));
@@ -118,9 +156,13 @@ function listenMessages() {
         default: body = content.length > 100 ? content.slice(0, 97) + '…' : content;
       }
 
-      const userSnap = await db.collection('users').doc(receiverId).get();
-      if (!userSnap.exists) continue;
-      const fcmToken = userSnap.data().fcmToken;
+      // Token FCM stocké dans la sous-collection privée (non accessible aux autres users)
+      const tokenSnap = await db
+        .collection('users').doc(receiverId)
+        .collection('private').doc('tokens')
+        .get();
+      if (!tokenSnap.exists) continue;
+      const fcmToken = tokenSnap.data().fcmToken;
       if (!fcmToken) continue;
 
       try {
@@ -249,8 +291,56 @@ function listenSchedules() {
   }, (err) => console.error('❌ Firestore schedules error:', err));
 }
 
-// ── 4. Endpoint : supprimer un utilisateur Firebase Auth ─────────────────────
-app.post('/deleteUser', async (req, res) => {
+// ── 4. Endpoint : valider un code d'accès (prof / admin) ─────────────────────
+// Le corps attendu : { "type": "teacher" | "Fondateur" | "Directeur" | ..., "code": "..." }
+// Les codes sont dans la variable d'env REGISTRATION_CODES (JSON encodé)
+// ex: { "teacher": "MON_CODE_PROF", "Fondateur": "MON_CODE_FOND", ... }
+app.post('/validateCode', codeLimiter, (req, res) => {
+  const { type, code } = req.body;
+  if (!type || !code) return res.json({ valid: false });
+
+  let codes;
+  try {
+    codes = JSON.parse(process.env.REGISTRATION_CODES || '{}');
+  } catch {
+    console.error('❌ REGISTRATION_CODES malformé');
+    return res.status(500).json({ valid: false, error: 'Server config error' });
+  }
+
+  const expected = codes[type];
+  if (!expected) {
+    console.warn(`⚠️  validateCode: type inconnu "${type}"`);
+    return res.json({ valid: false });
+  }
+
+  const valid = code.trim() === expected.trim();
+  console.log(`🔐 validateCode type="${type}" → ${valid ? '✅ valide' : '❌ invalide'}`);
+  res.json({ valid });
+});
+
+// ── 5. Endpoint : désactiver / réactiver un compte Firebase Auth ──────────────
+app.post('/setUserDisabled', adminLimiter, async (req, res) => {
+  const { uid, disabled, secret } = req.body;
+
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!uid) {
+    return res.status(400).json({ error: 'uid requis' });
+  }
+
+  try {
+    await admin.auth().updateUser(uid, { disabled: Boolean(disabled) });
+    console.log(`${disabled ? '🔒' : '🔓'} Auth ${disabled ? 'désactivé' : 'réactivé'} : ${uid}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`❌ setUserDisabled error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── 7. Endpoint : supprimer un utilisateur Firebase Auth ─────────────────────
+app.post('/deleteUser', adminLimiter, async (req, res) => {
   const { uid, secret } = req.body;
 
   if (secret !== process.env.ADMIN_SECRET) {
@@ -287,10 +377,4 @@ function startListeners() {
 }
 
 // ── Démarrage ─────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 HEC Notify Server — port ${PORT}`);
-  startListeners();
-  // Renouveler les listeners toutes les 20 min (évite la stagnation sur Render free)
-  setInterval(startListeners, 20 * 60 * 1000);
-});
+const PORT = process.env.PORT || 3000
