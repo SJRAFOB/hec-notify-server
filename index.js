@@ -6,9 +6,8 @@
 //   2. announcements             → notif par topic (tous / rôle / niveau / filière)
 //   3. schedules                 → notif aux étudiants concernés lors d'un nouveau cours
 
-const express   = require('express');
-const admin     = require('firebase-admin');
-const rateLimit = require('express-rate-limit');
+const express = require('express');
+const admin   = require('firebase-admin');
 
 // ── Firebase Admin ─────────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.GOOGLE_CREDENTIALS);
@@ -36,24 +35,31 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '10kb' })); // Limite le body à 10 Ko
 
-// ── Rate limiters ─────────────────────────────────────────────────────────────
-// Validation de code d'accès : 10 tentatives / 15 min par IP
-const codeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { valid: false, error: 'Trop de tentatives. Réessayez dans 15 minutes.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// ── Rate limiters (implémentation native, sans dépendance externe) ─────────────
+const _rlStore = new Map(); // ip → { count, resetAt }
 
-// Endpoints admin (disable/delete) : 20 requêtes / 5 min par IP
-const adminLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  max: 20,
-  message: { error: 'Trop de requêtes. Réessayez plus tard.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+function makeRateLimiter(maxReq, windowMs, message) {
+  return (req, res, next) => {
+    const ip  = req.ip || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    let   rec = _rlStore.get(ip);
+
+    if (!rec || now > rec.resetAt) {
+      _rlStore.set(ip, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    rec.count += 1;
+    if (rec.count > maxReq) {
+      return res.status(429).json(message);
+    }
+    next();
+  };
+}
+
+// Validation de code d'accès : 10 tentatives / 15 min par IP
+const codeLimiter  = makeRateLimiter(10, 15 * 60 * 1000, { valid: false, error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
+// Endpoints admin : 20 requêtes / 5 min par IP
+const adminLimiter = makeRateLimiter(20,  5 * 60 * 1000, { error: 'Trop de requêtes. Réessayez plus tard.' });
 
 // ── Health check (keep-alive) ─────────────────────────────────────────────────
 app.get('/',     (_req, res) => res.send('HEC Notify Server ✅'));
@@ -377,4 +383,6 @@ function startListeners() {
 }
 
 // ── Démarrage ─────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`
