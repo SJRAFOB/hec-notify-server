@@ -385,4 +385,8 @@ function startListeners() {
 // ── Démarrage ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`
+  console.log(`🚀 HEC Notify Server — port ${PORT}`);
+  startListeners();
+  // Renouveler les listeners toutes les 20 min (évite la stagnation sur Render free)
+  setInterval(startListeners, 20 * 60 * 1000);
+});
