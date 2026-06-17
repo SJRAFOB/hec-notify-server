@@ -1,9 +1,10 @@
 // hec_notify_server/index.js
 // Serveur de notifications push HEC Connect
 //
-// Écoute deux collections Firestore :
+// Écoute trois collections Firestore :
 //   1. conversations/*/messages  → notif directe au destinataire (token FCM)
 //   2. announcements             → notif par topic (tous / rôle / niveau / filière)
+//   3. schedules                 → notif aux étudiants concernés lors d'un nouveau cours
 
 const express = require('express');
 const admin   = require('firebase-admin');
@@ -16,8 +17,9 @@ const db  = admin.firestore();
 const app = express();
 app.use(express.json());
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.send('HEC Notify Server ✅'));
+// ── Health check (keep-alive) ─────────────────────────────────────────────────
+app.get('/',     (_req, res) => res.send('HEC Notify Server ✅'));
+app.get('/ping', (_req, res) => res.json({ status: 'alive', ts: Date.now() }));
 
 // ── Utilitaire : nettoyer un topic ────────────────────────────────────────────
 function cleanTopic(str) {
@@ -71,11 +73,14 @@ function targetsToTopics(targetPublicStr) {
     .filter(Boolean);
 }
 
+// Niveaux tronc commun (pas de filière)
+const TRONC_COMMUN = ['licence_1', 'master_1', 'bachelor_1'];
+
 // ── 1. Écoute des nouveaux messages (chat) ────────────────────────────────────
 function listenMessages() {
   console.log('👂 Écoute : conversations/*/messages');
 
-  db.collectionGroup('messages').onSnapshot(async (snapshot) => {
+  return db.collectionGroup('messages').onSnapshot(async (snapshot) => {
     for (const change of snapshot.docChanges()) {
       if (change.type !== 'added') continue;
 
@@ -143,7 +148,7 @@ function listenAnnouncements() {
 
   const startedAt = new Date();
 
-  db.collection('announcements').onSnapshot(async (snapshot) => {
+  return db.collection('announcements').onSnapshot(async (snapshot) => {
     for (const change of snapshot.docChanges()) {
       if (change.type !== 'added') continue;
 
@@ -185,7 +190,66 @@ function listenAnnouncements() {
   }, (err) => console.error('❌ Firestore announcements error:', err));
 }
 
-// ── 3. Endpoint : supprimer un utilisateur Firebase Auth ─────────────────────
+// ── 3. Écoute des nouveaux cours (emploi du temps) ───────────────────────────
+function listenSchedules() {
+  console.log('👂 Écoute : schedules');
+
+  const startedAt = new Date();
+
+  return db.collection('schedules').onSnapshot(async (snapshot) => {
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== 'added') continue;
+
+      const data = change.doc.data();
+
+      const createdAt = data.createdAt?.toDate?.() ?? new Date(0);
+      if (createdAt <= startedAt) continue;
+
+      const niveau    = data.niveau    ?? '';
+      const filiere   = data.filiere   ?? '';
+      const matiere   = data.matiere   ?? 'cours';
+      const jour      = data.jour      ?? '';
+      const slot      = data.slot      ?? '';
+      const profNom   = data.professeurNom ?? '';
+
+      if (!niveau) continue;
+
+      const niveauTopic = cleanTopic(niveau);
+      const troncCommun = TRONC_COMMUN.includes(niveauTopic);
+
+      const title = `📅 Nouveau cours — ${matiere}`;
+      const body  = `${jour} ${slot}${profNom ? ' • ' + profNom : ''}`;
+
+      // Tronc commun → notif par niveau (ex: licence_1)
+      // Avec filière → notif par filière (plus ciblé, ex: marketing)
+      const topics = troncCommun
+        ? [niveauTopic]
+        : (filiere ? [cleanTopic(filiere)] : [niveauTopic]);
+
+      console.log(`📅 Nouveau cours "${matiere}" → ${niveau}${filiere ? ' / ' + filiere : ' (tronc commun)'}`);
+
+      for (const topic of topics) {
+        try {
+          await admin.messaging().send({
+            topic,
+            notification: { title, body },
+            android: {
+              priority: 'high',
+              notification: { sound: 'default', channelId: 'hec_announcements' },
+            },
+            apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+            data: { type: 'schedule', niveau, filiere, matiere },
+          });
+          console.log(`  ✅ Cours notifié → topic "${topic}"`);
+        } catch (err) {
+          console.error(`  ❌ FCM schedule topic "${topic}" error:`, err.message);
+        }
+      }
+    }
+  }, (err) => console.error('❌ Firestore schedules error:', err));
+}
+
+// ── 4. Endpoint : supprimer un utilisateur Firebase Auth ─────────────────────
 app.post('/deleteUser', async (req, res) => {
   const { uid, secret } = req.body;
 
@@ -206,10 +270,27 @@ app.post('/deleteUser', async (req, res) => {
   }
 });
 
+// ── Gestion des listeners avec reconnexion automatique ────────────────────────
+let _unsubscribers = [];
+
+function startListeners() {
+  // Arrêter les anciens listeners avant de redémarrer
+  for (const unsub of _unsubscribers) {
+    try { unsub(); } catch (e) { /* ignore */ }
+  }
+  _unsubscribers = [];
+
+  console.log('🔄 Démarrage des listeners Firestore...');
+  _unsubscribers.push(listenMessages());
+  _unsubscribers.push(listenAnnouncements());
+  _unsubscribers.push(listenSchedules());
+}
+
 // ── Démarrage ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 HEC Notify Server — port ${PORT}`);
-  listenMessages();
-  listenAnnouncements();
+  startListeners();
+  // Renouveler les listeners toutes les 20 min (évite la stagnation sur Render free)
+  setInterval(startListeners, 20 * 60 * 1000);
 });
